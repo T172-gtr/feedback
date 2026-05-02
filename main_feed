@@ -1,0 +1,47 @@
+import requests
+import time
+
+TOKEN = "ВАШ_BOT_TOKEN"
+ADMIN_CHAT_ID = 123456789  # ваш личный chat_id
+API = f"https://api.telegram.org/bot{TOKEN}"
+
+offset = 0
+
+while True:
+    r = requests.get(f"{API}/getUpdates", params={
+        "offset": offset,
+        "timeout": 30,
+        "allowed_updates": ["message"]
+    }).json()
+
+    for upd in r.get("result", []):
+        offset = upd["update_id"] + 1
+        msg = upd.get("message")
+        if not msg:
+            continue
+
+        from_chat_id = msg["chat"]["id"]
+        message_id = msg["message_id"]
+
+        # Не пересылать ваши же сообщения обратно себе
+        if from_chat_id == ADMIN_CHAT_ID:
+            continue
+
+        # Пересылаем оригинал
+        requests.post(f"{API}/forwardMessage", data={
+            "chat_id": ADMIN_CHAT_ID,
+            "from_chat_id": from_chat_id,
+            "message_id": message_id
+        })
+
+        # Доп. подпись, кто прислал
+        user = msg.get("from", {})
+        name = user.get("first_name", "")
+        username = user.get("username", "нет username")
+
+        requests.post(f"{API}/sendMessage", data={
+            "chat_id": ADMIN_CHAT_ID,
+            "text": f"Новое сообщение от {name} (@{username})\nuser_id: {user.get('id')}"
+        })
+
+    time.sleep(1)
