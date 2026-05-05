@@ -1,0 +1,217 @@
+import os
+import time
+import json
+import html
+import requests
+
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+
+if not TOKEN:
+    raise ValueError("Не задана переменная окружения BOT_TOKEN")
+
+if not ADMIN_CHAT_ID:
+    raise ValueError("Не задана переменная окружения ADMIN_CHAT_ID")
+
+ADMIN_CHAT_ID = int(ADMIN_CHAT_ID)
+API = f"https://api.telegram.org/bot{TOKEN}"
+
+offset = 0
+reply_mode = {}  # admin_chat_id -> user_chat_id
+
+
+def tg(method, data=None):
+    response = requests.post(f"{API}/{method}", data=data or {}, timeout=60)
+    result = response.json()
+    if not result.get("ok"):
+        print(f"Telegram API error in {method}: {result}")
+    return result
+
+
+def tg_get(method, params=None):
+    response = requests.get(f"{API}/{method}", params=params or {}, timeout=65)
+    result = response.json()
+    if not result.get("ok"):
+        print(f"Telegram API error in {method}: {result}")
+    return result
+
+
+def get_updates(current_offset):
+    return tg_get("getUpdates", {
+        "offset": current_offset,
+        "timeout": 30,
+        "allowed_updates": json.dumps(["message", "callback_query"])
+    })
+
+
+def send_welcome(chat_id):
+    tg("sendMessage", {
+        "chat_id": chat_id,
+        "text": (
+            "Привет! Отправь сюда текст, фото, видео, кружок, голосовое "
+            "или документ — я передам это администратору."
+        )
+    })
+
+
+def get_user_info(msg):
+    user = msg.get("from", {}) or {}
+    first_name = user.get("first_name", "")
+    last_name = user.get("last_name", "")
+    full_name = (first_name + " " + last_name).strip() or "Без имени"
+    username = f"@{user['username']}" if user.get("username") else "нет username"
+    user_id = user.get("id", "unknown")
+    return full_name, username, user_id
+
+
+def notify_admin(msg):
+    from_chat_id = msg["chat"]["id"]
+    message_id = msg["message_id"]
+    full_name, username, user_id = get_user_info(msg)
+
+    caption = (
+        "📩 <b>Новая предложка</b>\n"
+        f"👤 {html.escape(full_name)} ({html.escape(username)})\n"
+        f"🆔 <code>{user_id}</code>\n"
+        f"💬 chat_id: <code>{from_chat_id}</code>"
+    )
+
+    keyboard = {
+        "inline_keyboard": [[
+            {
+                "text": "Ответить пользователю",
+                "callback_data": f"reply:{from_chat_id}"
+            }
+        ]]
+    }
+
+    tg("forwardMessage", {
+        "chat_id": ADMIN_CHAT_ID,
+        "from_chat_id": from_chat_id,
+        "message_id": message_id
+    })
+
+    tg("sendMessage", {
+        "chat_id": ADMIN_CHAT_ID,
+        "text": caption,
+        "parse_mode": "HTML",
+        "reply_markup": json.dumps(keyboard)
+    })
+
+
+def start_reply_mode(callback_query):
+    data = callback_query.get("data", "")
+    admin_chat_id = callback_query["message"]["chat"]["id"]
+
+    if admin_chat_id != ADMIN_CHAT_ID:
+        tg("answerCallbackQuery", {
+            "callback_query_id": callback_query["id"],
+            "text": "Недоступно",
+            "show_alert": False
+        })
+        return
+
+    if not data.startswith("reply:"):
+        return
+
+    user_chat_id = int(data.split(":", 1)[1])
+    reply_mode[admin_chat_id] = user_chat_id
+
+    tg("answerCallbackQuery", {
+        "callback_query_id": callback_query["id"],
+        "text": "Режим ответа включён",
+        "show_alert": False
+    })
+
+    tg("sendMessage", {
+        "chat_id": admin_chat_id,
+        "text": (
+            f"✍️ Следующее ваше сообщение уйдёт пользователю "
+            f"<code>{user_chat_id}</code>.\n\n"
+            "Чтобы отменить, отправьте /cancel"
+        ),
+        "parse_mode": "HTML"
+    })
+
+
+def cancel_reply_mode(chat_id):
+    if chat_id in reply_mode:
+        del reply_mode[chat_id]
+
+    tg("sendMessage", {
+        "chat_id": chat_id,
+        "text": "Режим ответа отменён."
+    })
+
+
+def send_admin_reply(admin_msg, user_chat_id):
+    result = tg("copyMessage", {
+        "chat_id": user_chat_id,
+        "from_chat_id": admin_msg["chat"]["id"],
+        "message_id": admin_msg["message_id"]
+    })
+
+    if result.get("ok"):
+        tg("sendMessage", {
+            "chat_id": admin_msg["chat"]["id"],
+            "text": "Ответ отправлен пользователю."
+        })
+    else:
+        tg("sendMessage", {
+            "chat_id": admin_msg["chat"]["id"],
+            "text": f"Не удалось отправить ответ: {result.get('description', 'unknown error')}"
+        })
+
+
+def handle_message(msg):
+    chat_id = msg["chat"]["id"]
+    text = msg.get("text", "")
+
+    if text == "/start":
+        send_welcome(chat_id)
+        return
+
+    if chat_id == ADMIN_CHAT_ID and text == "/cancel":
+        cancel_reply_mode(chat_id)
+        return
+
+    if chat_id == ADMIN_CHAT_ID and chat_id in reply_mode:
+        user_chat_id = reply_mode[chat_id]
+        send_admin_reply(msg, user_chat_id)
+        del reply_mode[chat_id]
+        return
+
+    if chat_id == ADMIN_CHAT_ID:
+        return
+
+    notify_admin(msg)
+
+
+def main():
+    global offset
+
+    print("Bot started")
+
+    while True:
+        try:
+            updates = get_updates(offset)
+
+            for upd in updates.get("result", []):
+                offset = upd["update_id"] + 1
+
+                if "callback_query" in upd:
+                    start_reply_mode(upd["callback_query"])
+                    continue
+
+                if "message" in upd:
+                    handle_message(upd["message"])
+
+            time.sleep(1)
+
+        except Exception as e:
+            print("ERROR:", e)
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()
